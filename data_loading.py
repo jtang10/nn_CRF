@@ -21,7 +21,7 @@ class Protein_Dataset(Dataset):
     def __getitem__(self, idx):
         protein_name = self.protein_list[idx]
         features, labels, length = self.read_protein(protein_name, self.relative_path, self.max_seq_len, self.padding)
-        return torch.from_numpy(features).double(), torch.from_numpy(labels).long(), length
+        return torch.from_numpy(features), torch.from_numpy(labels).long(), length
 
     def read_list(self, filename):
         """Given the filename storing all protein names, return a list of protein names.
@@ -61,7 +61,7 @@ class Protein_Dataset(Dataset):
                 protein_features = np.pad(protein_features, ((0, padding_length), (0, 0)),
                                           'constant', constant_values=((0, 0), (0, 0)))
                 protein_labels = np.pad(protein_labels, (0, padding_length), 'constant', constant_values=(0, 0))
-        return protein_features.transpose(), protein_labels, protein_length
+        return protein_features, protein_labels, protein_length
 
 if __name__ == '__main__':
     SetOf7604Proteins_path = '../data/SetOf7604Proteins/'
@@ -69,7 +69,7 @@ if __name__ == '__main__':
     validList_addr = 'validList'
     testList_addr = 'testList'
 
-    protein_dataset = Protein_Dataset(SetOf7604Proteins_path, testList_addr, max_seq_len=698, padding=False)
+    protein_dataset = Protein_Dataset(SetOf7604Proteins_path, testList_addr, max_seq_len=698, padding=True)
     dataloader = DataLoader(protein_dataset, batch_size=1, shuffle=False, num_workers=4)
 
     for i, sample_batched in enumerate(dataloader):

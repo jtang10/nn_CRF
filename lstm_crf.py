@@ -26,19 +26,11 @@ def argmax(vec):
     return to_scalar(idx)
 
 
-def prepare_sequence(seq, to_ix):
-    idxs = [to_ix[w] for w in seq]
-    tensor = torch.LongTensor(idxs)
-    return Variable(tensor)
-
-
 # Compute log sum exp in a numerically stable way for the forward algorithm
 def log_sum_exp(vec):
-    max_score = vec[0, argmax(vec)]
-    max_score_broadcast = max_score.view(1, -1).expand(1, vec.size()[1])
-    return max_score + \
-        torch.log(torch.sum(torch.exp(vec - max_score_broadcast)))
-
+    max_score, _ = torch.max(vec, 1)
+    result = max_score + torch.log(torch.sum(torch.exp(vec - max_score[:, None]), 1))
+    return result
 
 class BiLSTM_CRF(nn.Module):
     def __init__(self, n_features, n_hidden, n_layers=1):
@@ -55,50 +47,64 @@ class BiLSTM_CRF(nn.Module):
         self.transitions.data[:, STOP_TAG] = -10000
 
     def _get_lstm_features(self, prt_seqs):
+        """Given input of batched protein sequences, compute the lstm features.
+        Input: [seq_len, batch_size, features]
+        Output: [seq_len, batch_size, tagset_size]
+        """
         lstm_out, _ = self.lstm(prt_seqs)
         lstm_feats = self.linear(lstm_out)
         return lstm_feats
 
-    def _score_sentence(self, feats, tags):
-        # Gives the score of a ground truth tagged sequence
-        score = autograd.Variable(torch.Tensor([0]))
-        tags = torch.cat([torch.LongTensor([START_TAG]), tags])
-        for i, feat in enumerate(feats):
-            score = score + \
-                self.transitions[tags[i + 1], tags[i]] + feat[tags[i + 1]]
-        score = score + self.transitions[STOP_TAG, tags[-1]]
+    def _score_sequence(self, features, labels):
+        """Gives the scores of a batch of ground truth tagged sequences
+        feats: [sequence_length, batch_size, tagset_size]
+        labels: [sequence_length, batch_size]
+        """
+        batch_size = features.size()[1]
+        score = Variable(torch.zeros(batch_size))
+        start_labels = torch.LongTensor(1, batch_size).fill_(START_TAG)
+        stop_labels = torch.LongTensor(1, batch_size).fill_(STOP_TAG)
+        labels = torch.cat((start_labels, labels), 0)
+        for i, feat in enumerate(features):
+            score += self.transitions[labels[i + 1], labels[i]]# + feat[:, labels[i + 1]]
+        score = score + self.transitions[stop_labels, labels[-1]]
         return score
 
+
     def _forward_alg(self, feats):
-        # Do the forward algorithm to compute the partition function
-        init_alphas = torch.Tensor(1, self.tagset_size).fill_(-10000.)
+        """Do the forward algorithm to compute the partition function
+        feats: [sequence_length, batch_size, tagset_size]
+        """
+        init_alphas = torch.Tensor(feats.size()[1:]).fill_(-10000.)
         # START_TAG has all of the score.
-        init_alphas[0][START_TAG] = 0.
+        init_alphas[:, START_TAG] = 0.
 
         # Wrap in a variable so that we will get automatic backprop
-        forward_var = autograd.Variable(init_alphas)
+        forward_var = Variable(init_alphas)
 
         # Iterate through the sentence
         for feat in feats:
+            # feat.size() = batch_size x tagset_size
             alphas_t = []  # The forward variables at this timestep
             for next_tag in range(self.tagset_size):
                 # broadcast the emission score: it is the same regardless of
                 # the previous tag
-                emit_score = feat[next_tag].view(
-                    1, -1).expand(1, self.tagset_size)
+                emit_score = feat[:, next_tag].contiguous().view(-1, 1).expand_as(feat)
                 # the ith entry of trans_score is the score of transitioning to
-                # next_tag from i
-                trans_score = self.transitions[next_tag].view(1, -1)
+                # next_tag from i. transition is the same regardless of different sentences
+                trans_score = self.transitions[next_tag, :].view(1, -1).expand(feat.size())
                 # The ith entry of next_tag_var is the value for the
                 # edge (i -> next_tag) before we do log-sum-exp
+                # print(forward_var.size(), trans_score.size(), emit_score.size())
                 next_tag_var = forward_var + trans_score + emit_score
                 # The forward variable for this tag is log-sum-exp of all the
                 # scores.
                 alphas_t.append(log_sum_exp(next_tag_var))
-            forward_var = torch.cat(alphas_t).view(1, -1)
+            forward_var = torch.cat(alphas_t).view_as(next_tag_var)
         terminal_var = forward_var + self.transitions[STOP_TAG]
         alpha = log_sum_exp(terminal_var)
         return alpha
+
 
     def _viterbi_decode(self, feats):
         backpointers = []
@@ -144,11 +150,11 @@ class BiLSTM_CRF(nn.Module):
         best_path.reverse()
         return path_score, best_path
 
-    def neg_log_likelihood(self, sentence, tags):
-        feats = self._get_lstm_features(sentence)
+    def neg_log_likelihood(self, features, labels):
+        feats = self._get_lstm_features(features)
         forward_score = self._forward_alg(feats)
-        gold_score = self._score_sentence(feats, tags)
-        return forward_score, gold_score
+        gold_score = self._score_sequence(feats, labels)
+        return torch.mean(forward_score - gold_score)
 
     def forward(self, sentence):  # dont confuse this with _forward_alg above.
         # Get the emission scores from the BiLSTM
@@ -173,16 +179,23 @@ if __name__ == '__main__':
 
     train_dataset = Protein_Dataset(SetOf7604Proteins_path, trainList_addr, max_seq_len)
     valid_dataset = Protein_Dataset(SetOf7604Proteins_path, validList_addr, max_seq_len)
-    test_dataset = Protein_Dataset(SetOf7604Proteins_path, testList_addr, max_seq_len, padding=False)
+    test_dataset = Protein_Dataset(SetOf7604Proteins_path, testList_addr, max_seq_len, padding=True)
     len_train_dataset = len(train_dataset)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
     valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4)
+    test_loader = DataLoader(test_dataset, batch_size=2, shuffle=False, num_workers=4)
 
     model = BiLSTM_CRF(66, 50)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     for epoch in range(epochs):
         for i, (features, labels, lengths) in enumerate(test_loader):
-            features = Variable(features)
-            labels = Variable(labels)
+            features = Variable(features.float().transpose(0, 1))
+            labels = labels.transpose(0, 1)
+            optimizer.zero_grad()
+            loss = model.neg_log_likelihood(features, labels)
+            loss.backward()
+            if i % 20 == 0:
+                print('Loss at {}: {}'.format(i, loss.data[0]))
+            optimizer.step()
