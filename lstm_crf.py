@@ -1,5 +1,6 @@
 from __future__ import print_function, division
 import os
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,9 +29,14 @@ def argmax(vec):
 
 # Compute log sum exp in a numerically stable way for the forward algorithm
 def log_sum_exp(vec):
-    max_score, _ = torch.max(vec, 1)
-    result = max_score + torch.log(torch.sum(torch.exp(vec - max_score[:, None]), 1))
-    return result
+    """ Given a vector, return log_sum_exp with last dimension reduced.
+    """
+    last_dimension = len(vec.size()) - 1
+    max_score, _ = torch.max(vec, last_dimension)
+    _exp = torch.exp(vec - max_score.unsqueeze(last_dimension))
+    _sum = torch.sum(_exp, last_dimension)
+    _log = max_score + torch.log(_sum)
+    return _log
 
 class BiLSTM_CRF(nn.Module):
     def __init__(self, n_features, n_hidden, n_layers=1):
@@ -76,31 +82,70 @@ class BiLSTM_CRF(nn.Module):
         feats: [sequence_length, batch_size, tagset_size]
         """
         init_alphas = torch.Tensor(feats.size()[1:]).fill_(-10000.)
-        # START_TAG has all of the score.
         init_alphas[:, START_TAG] = 0.
+        forward_var = Variable(init_alphas.unsqueeze(1))
+
+        # Iterate through the sentence
+        for feat in feats:
+            # feat.size() = batch_size x tagset_size
+            emit_score = feat.unsqueeze(2)
+            # [batch, tagset, tagset] = [batch, 1, tagset] + [tagset, tagset] + [batch.tagset, 1]
+            tag_var = forward_var + self.transitions + emit_score
+            forward_var = log_sum_exp(tag_var).unsqueeze(1)
+        terminal_var = (forward_var + self.transitions[STOP_TAG]).squeeze()
+        alpha = log_sum_exp(terminal_var)
+        return alpha
+
+
+    def _forward_alg2(self, feats):
+        # calculate in log domain
+        # feats is len(sentence) * tagset_size
+        # initialize alpha with a Tensor with values all equal to -10000.
+        init_alphas = torch.Tensor(1, self.tagset_size).fill_(-10000.)
+        init_alphas[0][START_TAG] = 0.
+        forward_var = Variable(init_alphas)
+        for feat in feats:
+            # emit_score: tagset_size x 1
+            # transitions: tagset_size x tagset_size
+            # forward_var: 1 x tagset_size
+            emit_score = feat.view(-1, 1)
+            tag_var = forward_var + self.transitions + emit_score
+            max_tag_var, _ = torch.max(tag_var, dim=1)
+            tag_var = tag_var - max_tag_var.view(-1, 1)
+            forward_var = max_tag_var + torch.log(torch.sum(torch.exp(tag_var), dim=1)).view(1, -1) # ).view(1, -1)
+        terminal_var = (forward_var + self.transitions[STOP_TAG]).view(1, -1)
+        alpha = log_sum_exp(terminal_var)
+        # Z(x)
+        return alpha
+
+
+    def _forward_alg_origin(self, feats):
+        # Do the forward algorithm to compute the partition function
+        init_alphas = torch.Tensor(1, self.tagset_size).fill_(-10000.)
+        # START_TAG has all of the score.
+        init_alphas[0][START_TAG] = 0.
 
         # Wrap in a variable so that we will get automatic backprop
         forward_var = Variable(init_alphas)
 
         # Iterate through the sentence
         for feat in feats:
-            # feat.size() = batch_size x tagset_size
             alphas_t = []  # The forward variables at this timestep
             for next_tag in range(self.tagset_size):
                 # broadcast the emission score: it is the same regardless of
                 # the previous tag
-                emit_score = feat[:, next_tag].contiguous().view(-1, 1).expand_as(feat)
+                emit_score = feat[next_tag].view(
+                    1, -1).expand(1, self.tagset_size)
                 # the ith entry of trans_score is the score of transitioning to
-                # next_tag from i. transition is the same regardless of different sentences
-                trans_score = self.transitions[next_tag, :].view(1, -1).expand(feat.size())
+                # next_tag from i
+                trans_score = self.transitions[next_tag].view(1, -1)
                 # The ith entry of next_tag_var is the value for the
                 # edge (i -> next_tag) before we do log-sum-exp
-                # print(forward_var.size(), trans_score.size(), emit_score.size())
                 next_tag_var = forward_var + trans_score + emit_score
                 # The forward variable for this tag is log-sum-exp of all the
                 # scores.
                 alphas_t.append(log_sum_exp(next_tag_var))
-            forward_var = torch.cat(alphas_t).view_as(next_tag_var)
+            forward_var = torch.cat(alphas_t).view(1, -1)
         terminal_var = forward_var + self.transitions[STOP_TAG]
         alpha = log_sum_exp(terminal_var)
         return alpha
@@ -184,7 +229,7 @@ if __name__ == '__main__':
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
     valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=2, shuffle=False, num_workers=4)
+    test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, num_workers=4)
 
     model = BiLSTM_CRF(66, 50)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -193,9 +238,29 @@ if __name__ == '__main__':
         for i, (features, labels, lengths) in enumerate(test_loader):
             features = Variable(features.float().transpose(0, 1))
             labels = labels.transpose(0, 1)
-            optimizer.zero_grad()
-            loss = model.neg_log_likelihood(features, labels)
-            loss.backward()
-            if i % 20 == 0:
-                print('Loss at {}: {}'.format(i, loss.data[0]))
-            optimizer.step()
+            # optimizer.zero_grad()
+            feats = model._get_lstm_features(features)
+            print('feats.size():', feats.size())
+            start = time.time()
+            score_parallel = model._forward_alg(feats).data.tolist()
+            print("parallel spent {:.3}s".format(time.time() - start))
+            score_slowest, score_slow = [], []
+
+            start = time.time()
+            for feat in feats.transpose(0, 1):
+                score_slowest.append(model._forward_alg_origin(feat).data.tolist())
+            print("Original spent {:.3}s".format(time.time() - start))
+
+            start = time.time()
+            for feat in feats.transpose(0, 1):
+                score_slow.append(model._forward_alg2(feat).data.tolist())
+            print("Improve spent {:.3}s".format(time.time() - start))
+
+            print(score_parallel)
+            print(score_slowest)
+            print(score_slow)
+            if i == 0: break
+            # loss.backward()
+            # if i % 20 == 0:
+            #     print('Loss at {}: {}'.format(i, loss.data[0]))
+            # optimizer.step()
