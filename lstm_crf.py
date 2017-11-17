@@ -97,61 +97,41 @@ class BiLSTM_CRF(nn.Module):
         return alpha
 
 
-    def _forward_alg2(self, feats):
-        # calculate in log domain
-        # feats is len(sentence) * tagset_size
-        # initialize alpha with a Tensor with values all equal to -10000.
-        init_alphas = torch.Tensor(1, self.tagset_size).fill_(-10000.)
-        init_alphas[0][START_TAG] = 0.
-        forward_var = Variable(init_alphas)
-        for feat in feats:
-            # emit_score: tagset_size x 1
-            # transitions: tagset_size x tagset_size
-            # forward_var: 1 x tagset_size
-            emit_score = feat.view(-1, 1)
-            tag_var = forward_var + self.transitions + emit_score
-            max_tag_var, _ = torch.max(tag_var, dim=1)
-            tag_var = tag_var - max_tag_var.view(-1, 1)
-            forward_var = max_tag_var + torch.log(torch.sum(torch.exp(tag_var), dim=1)).view(1, -1) # ).view(1, -1)
-        terminal_var = (forward_var + self.transitions[STOP_TAG]).view(1, -1)
-        alpha = log_sum_exp(terminal_var)
-        # Z(x)
-        return alpha
-
-
-    def _forward_alg_origin(self, feats):
-        # Do the forward algorithm to compute the partition function
-        init_alphas = torch.Tensor(1, self.tagset_size).fill_(-10000.)
-        # START_TAG has all of the score.
-        init_alphas[0][START_TAG] = 0.
-
-        # Wrap in a variable so that we will get automatic backprop
-        forward_var = Variable(init_alphas)
-
-        # Iterate through the sentence
-        for feat in feats:
-            alphas_t = []  # The forward variables at this timestep
-            for next_tag in range(self.tagset_size):
-                # broadcast the emission score: it is the same regardless of
-                # the previous tag
-                emit_score = feat[next_tag].view(
-                    1, -1).expand(1, self.tagset_size)
-                # the ith entry of trans_score is the score of transitioning to
-                # next_tag from i
-                trans_score = self.transitions[next_tag].view(1, -1)
-                # The ith entry of next_tag_var is the value for the
-                # edge (i -> next_tag) before we do log-sum-exp
-                next_tag_var = forward_var + trans_score + emit_score
-                # The forward variable for this tag is log-sum-exp of all the
-                # scores.
-                alphas_t.append(log_sum_exp(next_tag_var))
-            forward_var = torch.cat(alphas_t).view(1, -1)
-        terminal_var = forward_var + self.transitions[STOP_TAG]
-        alpha = log_sum_exp(terminal_var)
-        return alpha
-
-
     def _viterbi_decode(self, feats):
+        """Given the LSTM extracted features [Seq_len x Batch_size x tagset_size], return the Viterbi
+           Decoded score and most probable sequence prediction.
+        """
+        batch_size = feats.size()[1]
+        backpointers = []
+        init_vvars = torch.Tensor(feats.size()[1:]).fill_(-10000.)
+        init_vvars[:, START_TAG] = 0
+        forward_var = Variable(init_vvars.unsqueeze(1)) # [batch x 1 x tagset]
+
+        for feat in feats:
+            # next_tag_var: [batch x tagset x tagset]
+            next_tag_var = forward_var + self.transitions
+            # viterbi_vars: [batch x tagset]
+            viterbi_vars, best_tag_id = next_tag_var.max(2)
+            forward_var = (viterbi_vars + feat).unsqueeze(1)
+            # list of [batch x tagset], equivalent to [seq_len x batch x tagset]
+            backpointers.append(best_tag_id)
+
+        # terminal_var: [batch x tagset]
+        terminal_var = (forward_var + self.transitions[STOP_TAG]).squeeze()
+        path_score, best_tag_id = terminal_var.max(1)
+
+        best_path = [best_tag_id.unsqueeze(0)] # [batch]
+        for backpointer in reversed(backpointers):
+            # backpointer: [batch x tagset]
+            best_tag_id = backpointer[range(batch_size), best_tag_id.data]
+            best_path.append(best_tag_id.unsqueeze(0))
+        start = best_path.pop()
+        # assert start[:, 0] == START_TAG
+        best_path = torch.cat(best_path[::-1], 0)
+        return path_score, best_path
+
+
+    def _viterbi_decode_origin(self, feats):
         backpointers = []
 
         # Initialize the viterbi variables in log space
@@ -240,25 +220,21 @@ if __name__ == '__main__':
             labels = labels.transpose(0, 1)
             # optimizer.zero_grad()
             feats = model._get_lstm_features(features)
-            print('feats.size():', feats.size())
-            start = time.time()
-            score_parallel = model._forward_alg(feats).data.tolist()
-            print("parallel spent {:.3}s".format(time.time() - start))
-            score_slowest, score_slow = [], []
 
             start = time.time()
-            for feat in feats.transpose(0, 1):
-                score_slowest.append(model._forward_alg_origin(feat).data.tolist())
-            print("Original spent {:.3}s".format(time.time() - start))
-
+            score2, tagged_seq2 = model._viterbi_decode(feats)
+            print("Time spent on decoding: {:.3f}s".format(time.time() - start))
+            scores, tagged_seqs = [], []
             start = time.time()
             for feat in feats.transpose(0, 1):
-                score_slow.append(model._forward_alg2(feat).data.tolist())
-            print("Improve spent {:.3}s".format(time.time() - start))
-
-            print(score_parallel)
-            print(score_slowest)
-            print(score_slow)
+                score, tagged_seq = model._viterbi_decode_origin(feat)
+                scores.append(score)
+                tagged_seqs.append(tagged_seq)
+            print("Time spent on decoding original: {:.3f}s".format(time.time() - start))
+            print(len(scores), len(tagged_seqs), len(tagged_seqs[0]))
+            print(score2)
+            print(scores)
+            assert tagged_seq2[:, 0].data.tolist() == tagged_seqs[0]
             if i == 0: break
             # loss.backward()
             # if i % 20 == 0:
