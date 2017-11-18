@@ -18,7 +18,7 @@ def sort_by_length(input_features, input_labels, input_lengths):
 
 
 class BiLSTM(nn.Module):
-    def __init__(self, n_hidden, n_layers=1, linear_out):
+    def __init__(self, n_hidden, linear_out, n_layers=1):
         super(BiLSTM, self).__init__()
         self.lstm = nn.LSTM(66, n_hidden // 2, n_layers, bidirectional=True)
         self.linear = nn.Linear(n_hidden, linear_out)

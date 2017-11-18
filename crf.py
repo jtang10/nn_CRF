@@ -11,6 +11,8 @@ from tensorboardX import SummaryWriter
 
 from data_loading import Protein_Dataset
 
+START_TAG = 8
+STOP_TAG = 9
 
 # Compute log sum exp in a numerically stable way for the forward algorithm
 def log_sum_exp(vec):
