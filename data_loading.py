@@ -21,7 +21,7 @@ class Protein_Dataset(Dataset):
     def __getitem__(self, idx):
         protein_name = self.protein_list[idx]
         features, labels, length = self.read_protein(protein_name, self.relative_path, self.max_seq_len, self.padding)
-        return torch.from_numpy(features), torch.from_numpy(labels).long(), length
+        return torch.from_numpy(features).float(), torch.from_numpy(labels).long(), length
 
     def read_list(self, filename):
         """Given the filename storing all protein names, return a list of protein names.

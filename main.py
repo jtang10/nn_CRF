@@ -8,15 +8,14 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
-from data_loading import Protein_Dataset
 
-from lstm import BiLSTM
-from crf import CRF
+from data_loading import Protein_Dataset
+from model import LSTM_CRF, BiLSTM
 from utils import *
 
 max_seq_len = 698
 batch_size = 64
-epochs = 1
+epochs = 30
 START_TAG = 8
 STOP_TAG = 9
 
@@ -36,7 +35,15 @@ train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, nu
 valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
 
-model = BiLSTM(100, 8)
+# model = BiLSTM(100, 8)
+ix_counter = 0
+writer_path = os.path.join("logger", 'test' + str(ix_counter))
+while os.path.exists(writer_path):
+    ix_counter += 1
+    writer_path = os.path.join("logger", 'test' + str(ix_counter))
+writer = SummaryWriter(log_dir=writer_path)
+
+model = LSTM_CRF(100)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 criterion = nn.CrossEntropyLoss()
 
@@ -46,16 +53,26 @@ if use_cuda:
 
 
 for epoch in range(epochs):
+    model.train()
+    step_counter = 0
     for i, (features, labels, lengths) in enumerate(train_loader):
-        features = cuda_var_wrapper(features.float().transpose(0, 1))
+        features = cuda_var_wrapper(features.transpose(0, 1))
         labels = cuda_var_wrapper(labels.transpose(0, 1))
         features, labels, lengths = sort_by_length(features, labels, lengths)
-        output = model(features, lengths)
-        print(output.size())
+        output = model.decode(features, lengths)
         optimizer.zero_grad()
         loss = criterion(output.view(-1, 8), labels.view(-1))
+        step_counter += features.size()[1]
+        writer.add_scalar('data/loss', loss.data[0], step_counter + epoch * len_train_dataset)
         loss.backward()
         optimizer.step()
-        if i == 5: break
         if i % 20 == 0:
-            print("Step {}, loss: {:.3f}".format(i, loss.data[0]))
+            print ('Epoch [%d/%d], Iter [%d/%d] Loss: %.4f' 
+               %(epoch+1, epochs, i, len_train_dataset//batch_size, loss.data[0]))
+        # if i == 5: break
+
+    accuracy_train = evaluate(model, train_loader)
+    accuracy_valid = evaluate(model, valid_loader)
+    writer.add_scalars('data/accuracy_group', {'accuracy_train': accuracy_train,
+                                               'accuracy_valid': accuracy_valid}, (epoch + 1) * len_train_dataset)
+    print("Training accuracy {:.4f}; Validation accuracy {:.4f}".format(accuracy_train, accuracy_valid))
