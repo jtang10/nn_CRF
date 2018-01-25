@@ -16,21 +16,25 @@ use_cuda = torch.cuda.is_available()
 START_TAG = 8
 STOP_TAG = 9
 
+class LSTM_Multi_CRF(nn.Module):
+    def __init__(self, n_hidden, n_layers=1, dropout_rate=0.5):
+        super(LSTM_Multi_CRF, self).__init__()
+        # self.lstm = BiLSTM(n_hidden, )
 
 class LSTM_CRF(nn.Module):
     def __init__(self, n_hidden, n_layers=1, dropout_rate=0.5):
         super(LSTM_CRF, self).__init__()
         self.lstm = BiLSTM(n_hidden, 10, dropout_rate=dropout_rate, n_layers=n_layers)
-        self.crf1 = CRF()
+        self.crf = CRF()
 
     def forward(self, features, labels, lengths):
         lstm_feats = self.lstm(features, lengths)
-        score = self.crf1.neg_log_likelihood(lstm_feats, labels)
+        score = self.crf.neg_log_likelihood(lstm_feats, labels)
         return score
 
     def decode(self, features, lengths):
         lstm_feats = self.lstm(features, lengths)
-        _, output = self.crf1(lstm_feats)
+        _, output = self.crf(lstm_feats)
         return output
 
 
@@ -45,15 +49,15 @@ class BiLSTM(nn.Module):
         packed_input = pack_padded_sequence(features, lengths)
         output, _ = self.lstm(packed_input)
         output, _ = pad_packed_sequence(output)
-        output = self.linear(output)
         output = self.dropout(output)
+        output = self.linear(output)
         return output
 
 
 class CRF(nn.Module):
-    def __init__(self):
+    def __init__(self, tagset_size=10):
         super(CRF, self).__init__()
-        self.tagset_size = 10 # 8 labels + START_TAG + STOP_TAG
+        self.tagset_size = tagset_size # 8 labels + START_TAG + STOP_TAG
         # transitions[i,j] = the score of transitioning from j to i. Enforcing no 
         # transition from STOP_TAG and to START_TAG
         self.transitions = nn.Parameter(torch.randn(self.tagset_size, self.tagset_size))
@@ -147,40 +151,3 @@ class CRF(nn.Module):
     def forward(self, feats):  
         score, tag_seq = self._viterbi_decode(feats)
         return score, tag_seq
-
-
-# For testing only
-if __name__ == '__main__':
-    max_seq_len = 200
-    batch_size = 2
-
-    SetOf7604Proteins_path = os.path.expanduser('../data/SetOf7604Proteins/')
-    testList_addr = 'testList'
-    test_dataset = Protein_Dataset(SetOf7604Proteins_path, testList_addr, max_seq_len, padding=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-
-    lstm = BiLSTM(100, 10)
-    model = CRF()
-    for i, (features, labels, lengths) in enumerate(test_loader):
-        features = cuda_var_wrapper(features.transpose(0, 1))
-        labels = cuda_var_wrapper(labels.transpose(0, 1))
-        features, labels, lengths = sort_by_length(features, labels, lengths)
-        feat = lstm(features, lengths)
-        print(feat.size())
-        print(labels.size())
-        # test = model.neg_log_likelihood(feat, labels.data)
-        # score1, path1 = model._viterbi_decode(feat)
-        score1 = model._score_sequence(feat, labels)
-        # path1 = path1.t().data.tolist()
-        score, path = [], []
-        for j in range(batch_size):
-            # score2, path2 = model._viterbi_decode_origin(feat[:, j, :])
-            score2 = model._score_sentence_original(feat[:, j, :], labels.data[:, j])
-            score.append(score2)
-            # path.append(path2)
-        score = torch.cat(score)
-        print(score1, score)
-        # print(path1)
-        # print(path)
-        # print(path1 == path)
-        if i == 0: break

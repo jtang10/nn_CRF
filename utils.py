@@ -35,21 +35,38 @@ def cuda_var_wrapper(var, volatile=False):
         var = var.cuda()
     return var
 
-def evaluate(model, dataloader, rnn=True):
+def evaluate(model, dataloader):
     model.eval()
-    correct = 0.0
-    total = 0.0
-    for i, (features, labels, lengths) in enumerate(dataloader):
+    correct = 0
+    total = 0
+    loss_total = 0
+    for i, (features, labels, lengths, _) in enumerate(dataloader):
         features = cuda_var_wrapper(features.transpose(0, 1), volatile=True)
         labels = cuda_var_wrapper(labels.transpose(0, 1), volatile=True)
-        if rnn:
-            features, labels, lengths = sort_by_length(features, labels, lengths)
-        output = model.decode(features, lengths)
+        features, labels, lengths = sort_by_length(features, labels, lengths)
+        if list(model.named_children())[-1][0] == 'crf':
+            output = model.decode(features, lengths)
+            loss = model(features, labels, lengths)
+        else:
+            output = model(features, lengths)
+            # loss = criterion(output.view(-1, 8), labels.view(-1))
+        loss_total += loss.data[0] * features.size()[1]
         correct_batch, total_batch = get_batch_accuracy(labels, output, lengths)
         correct += correct_batch
         total += total_batch
-    print("{} out of {} label predictions are correct".format(correct, total))
-    return correct / total
+    return correct / total, loss_total
+
+def eval(model, features, labels, lengths, crf):
+    model.eval()
+    if crf:
+        loss = model(features, labels, lengths)
+        output = model.decode(features, lengths)
+    else:
+        loss = criterion(output.view(-1, 8), labels.view(-1))
+        output = model(features, lengths)
+    loss_batch = loss.data[0] * features.size()[1]
+    correct_batch, total_batch = get_batch_accuracy(labels, output, lengths)
+    return correct_batch, total_batch, loss_batch
 
 def get_batch_accuracy(labels, output, lengths):
     """Get the number of correct predictions within the batch.
@@ -58,7 +75,8 @@ def get_batch_accuracy(labels, output, lengths):
     """
     correct = 0.0
     total = 0.0
-    # _, output = torch.max(output, 2)
+    if len(output.size()) > 2:
+        _, output = torch.max(output, 2)
     correct_matrix = torch.eq(output, labels).data
     for j, length in enumerate(lengths):
             correct += torch.sum(correct_matrix[:length, j])
